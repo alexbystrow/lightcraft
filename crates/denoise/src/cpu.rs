@@ -4,14 +4,15 @@
 //! No inner thread pool: `run::denoise_bayer` already runs tiles on the application's Rayon pool. Tensor lifetimes
 //! are planned once; buffers and im2col storage are recycled between calls, independently for concurrent callers.
 
-use crate::net::{Net, NetError, Op};
+use crate::net::{Activation, Net, NetError, Op};
 use crate::run::{Error, TileRunner};
 use faer::{Parallelism, mat};
 use std::sync::{Arc, Mutex};
 
 const BLOCK: usize = 256;
-/// Cap all tensor buffers and convolution scratch for one tile together (512 MiB).
-const MAX_VALUES: usize = 128 * 1024 * 1024;
+/// Cap all tensor buffers and convolution scratch for one tile together (768 MiB: the RGB model at a 768 tile needs
+/// about 515 MiB).
+const MAX_VALUES: usize = 192 * 1024 * 1024;
 const MAX_TILE: usize = 2048;
 const MAX_IDLE: usize = 1;
 
@@ -69,12 +70,12 @@ impl NetRunner {
     pub fn new(net: &Net, tile: usize) -> Result<Self> {
         if tile == 0
             || tile > MAX_TILE
-            || !net.fits_tile(tile)
-            || net.in_channels != 4
             || net.out_channels() != 3
             || net.shape(0).is_none_or(|s| s.channels != net.in_channels)
+            // Bayer to RGB: 4 planes in, 3 out at twice the size; RGB to RGB: 3 planes in, 3 out at the same size
+            || !((net.in_channels == 4 && net.fits_tile(tile)) || (net.in_channels == 3 && net.fits_tile_at(tile, 0)))
         {
-            return Err(bad("the tile or Bayer-to-RGB contract does not fit the network"));
+            return Err(bad("the tile or the Bayer-to-RGB / RGB-to-RGB contract does not fit the network"));
         }
         let mut last = vec![0; net.ops().len() + 1];
         for (i, op) in net.ops().iter().enumerate() {
@@ -166,6 +167,14 @@ impl NetRunner {
     pub fn net(&self) -> &Net {
         &self.plan.net
     }
+    /// Channels of the output (3).
+    pub fn out_channels(&self) -> usize {
+        self.plan.tensors.last().map_or(0, |t| t.channels)
+    }
+    /// Side of the output in pixels (`2·tile` for Bayer to RGB, `tile` for RGB to RGB).
+    pub fn out_side(&self) -> usize {
+        self.plan.tensors.last().map_or(0, |t| t.side)
+    }
     pub fn bytes_per_tile(&self) -> usize {
         (self.plan.sizes.iter().sum::<usize>() + self.plan.lower + self.plan.product) * 4
     }
@@ -248,9 +257,8 @@ impl TileRunner for NetRunner {
         result
     }
 }
-fn activate(x: f32, bias: f32, alpha: Option<f32>) -> f32 {
-    let x = x + bias;
-    if x < 0.0 { x * alpha.unwrap_or(1.0) } else { x }
+fn activate(x: f32, bias: f32, act: Activation) -> f32 {
+    act.apply(x + bias)
 }
 
 /// All views are over exact, checked slices. The matrix library's assertions therefore never see file-derived sizes.
@@ -318,7 +326,7 @@ fn conv(c: &crate::net::Conv, a: &[f32], b: Option<&[f32]>, side: usize, dest: &
         for ((row, &bias), out) in y.chunks_exact(n).zip(&c.bias).zip(dest.chunks_exact_mut(pixels)) {
             let to = out.get_mut(start..start + n).ok_or_else(|| bad("short convolution output"))?;
             for (d, &v) in to.iter_mut().zip(row) {
-                *d = activate(v, bias, c.leaky);
+                *d = activate(v, bias, c.activation);
             }
         }
     }
@@ -341,7 +349,7 @@ fn up(c: &crate::net::ConvT2, a: &[f32], side: usize, dest: &mut [f32], weights:
                 for (j, &v) in row.iter().enumerate() {
                     let p = start + j;
                     let at = (2 * (p / side) + d / 2) * out_side + 2 * (p % side) + d % 2;
-                    *out.get_mut(at).ok_or_else(|| bad("short up output"))? = activate(v, bias, c.leaky);
+                    *out.get_mut(at).ok_or_else(|| bad("short up output"))? = activate(v, bias, c.activation);
                 }
             }
         }
