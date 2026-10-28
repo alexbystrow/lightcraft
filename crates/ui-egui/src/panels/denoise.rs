@@ -473,6 +473,8 @@ fn model_row(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, m: &Value, 
                         ui.label(RichText::new(tr("installed")).color(t.text_dim));
                     }
                 });
+                let made_for = if m["domain"] == "rgbToRgb" { tr("For JPEG and other finished pictures") } else { tr("For raw photos") };
+                ui.label(RichText::new(made_for).font(t.font(11.5)).color(t.text_dim));
                 ui.label(RichText::new(licence_line(m)).font(t.font(11.5)).color(if m["licence"]["commercial"] == "yes" {
                     t.text_dim
                 } else {
@@ -526,7 +528,8 @@ fn model_row(app: &mut LightcraftApp, ui: &mut egui::Ui, t: &Tokens, m: &Value, 
                         let r = ui.button(tr("Turn off"));
                         register(ui, format!("denoise:off:{id}"), r.rect);
                         if r.clicked() {
-                            let _ = app.run("denoise.models.select", json!({"id": null}));
+                            let kind = if m["domain"] == "rgbToRgb" { "rgb" } else { "raw" };
+                            let _ = app.run("denoise.models.select", json!({"id": null, "kind": kind}));
                             app.caches.denoise.epoch += 1;
                         }
                     } else {

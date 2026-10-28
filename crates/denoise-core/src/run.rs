@@ -227,6 +227,116 @@ pub fn denoise_bayer(
     Ok(Rgb32f { width, height, data: acc })
 }
 
+/// Denoise a finished picture (`Domain::RgbToRgb`): `image` is gamma-encoded sRGB in 0 to 1, cut into overlapping
+/// `tile × tile` tiles (mirrored at the picture's edges when it is smaller than one), each run through the model and
+/// blended back. Gives the same encoding at the same size. The model's own scale is kept (`Gain::None`).
+pub fn denoise_rgb(image: &Rgb32f, runner: &dyn TileRunner, p: &Params, ctl: &Control<'_>) -> Result<Rgb32f, Error> {
+    let (width, height) = (image.width, image.height);
+    let pixels = width
+        .checked_mul(height)
+        .filter(|&n| n > 0 && n <= MAX_PIXELS && n == image.data.len())
+        .ok_or_else(|| Error::Input("the picture has no size, is too large or does not hold width × height pixels".into()))?;
+    if image.data.iter().flatten().any(|v| !v.is_finite()) {
+        return Err(Error::Input("the picture has samples that are not finite".into()));
+    }
+    if !(16..=2048).contains(&p.tile) || p.overlap >= p.tile.div_ceil(2) {
+        return Err(Error::Input("the tile size and overlap do not fit".into()));
+    }
+    let t = p.tile;
+    let (sx, sy) = (starts(width, t, p.overlap), starts(height, t, p.overlap));
+    let (cols, rows) = (sx.len(), sy.len());
+    if cols == 0 || rows == 0 {
+        return Err(Error::Input("the picture needs too many tiles".into()));
+    }
+    type Tile = (usize, usize, bool, bool, bool, bool);
+    let tiles: Vec<Tile> = sy
+        .iter()
+        .enumerate()
+        .flat_map(|(j, &y0)| sx.iter().enumerate().map(move |(i, &x0)| (x0, y0, i > 0, i + 1 < cols, j > 0, j + 1 < rows)))
+        .collect();
+    let total = tiles.len();
+    let mut acc = allocate(pixels, [0f32; 3])?;
+    let mut wsum = allocate(pixels, 0f32)?;
+    // mirrored index into `0..n` (n ≥ 1): a tile reaching past the edge sees the picture reflected
+    let mirror = |v: usize, n: usize| -> usize {
+        let period = 2 * n.max(1) - 1;
+        let m = v % period.max(1);
+        if m < n { m } else { period - m }
+    };
+    let compute = |chunk: &[Tile]| -> Vec<Result<Vec<f32>, Error>> {
+        chunk
+            .par_iter()
+            .map(|&(x0, y0, ..)| {
+                let mut input = allocate(3 * t * t, 0f32)?;
+                for j in 0..t {
+                    let y = mirror(y0 + j, height);
+                    for i in 0..t {
+                        let x = mirror(x0 + i, width);
+                        let px = image.data.get(y * width + x).copied().unwrap_or([0.0; 3]);
+                        for (c, v) in px.iter().enumerate() {
+                            if let Some(s) = input.get_mut(c * t * t + j * t + i) {
+                                *s = v.clamp(0.0, 1.0);
+                            }
+                        }
+                    }
+                }
+                let out = runner.run(&input)?;
+                if out.len() != 3 * t * t {
+                    return Err(Error::Model(format!("{} numbers for a tile, not the {} expected", out.len(), 3 * t * t)));
+                }
+                if out.iter().any(|v| !v.is_finite()) {
+                    return Err(Error::Model("numbers that are not finite".into()));
+                }
+                Ok(out)
+            })
+            .collect()
+    };
+    let group = p.parallel.clamp(1, 4);
+    let mut done = 0;
+    for chunk in tiles.chunks(group) {
+        if ctl.cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(Error::Cancelled);
+        }
+        for (&(x0, y0, bx, ax, by, ay), out) in chunk.iter().zip(compute(chunk)) {
+            let out = out?;
+            let wx: Vec<f32> = (0..t).map(|i| weight(i, t, p.overlap, bx, ax)).collect();
+            let wy: Vec<f32> = (0..t).map(|j| weight(j, t, p.overlap, by, ay)).collect();
+            for (j, &b) in wy.iter().enumerate() {
+                let y = y0 + j;
+                if y >= height {
+                    break;
+                }
+                for (i, &a) in wx.iter().enumerate() {
+                    let x = x0 + i;
+                    if x >= width {
+                        break;
+                    }
+                    let w = a * b;
+                    let k = y * width + x;
+                    let (Some(px), Some(s)) = (acc.get_mut(k), wsum.get_mut(k)) else { continue };
+                    *s += w;
+                    for (c, v) in px.iter_mut().enumerate() {
+                        *v += w * out.get(c * t * t + j * t + i).copied().unwrap_or(0.0);
+                    }
+                }
+            }
+            done += 1;
+            if let Some(f) = ctl.progress {
+                f(done, total);
+            }
+        }
+    }
+    acc.par_iter_mut().zip(wsum.par_iter()).for_each(|(px, &w)| {
+        if w > 0.0 {
+            *px = px.map(|v| v / w);
+        }
+    });
+    if acc.iter().flatten().any(|v| !v.is_finite()) {
+        return Err(Error::Model("numbers that are not finite after tile blending".into()));
+    }
+    Ok(Rgb32f { width, height, data: acc })
+}
+
 /// Bring a tile's output to the input's scale and keep clipped highlights as they were (in place).
 fn finish_tile(input: &[f32], out: &mut [f32], p: &Params, edges: (bool, bool, bool, bool)) {
     let t = p.tile;
@@ -661,5 +771,51 @@ mod tests {
             denoise_bayer(&[], MAX_PIXELS + 1, 1, layout, &model, &p, &Control::default()),
             Err(Error::Input(message)) if message == "the picture has no size, or is too large"
         ));
+    }
+
+    /// A stand-in finished-picture model that gives its tile back.
+    struct Same(usize);
+    impl TileRunner for Same {
+        fn run(&self, input: &[f32]) -> Result<Vec<f32>, Error> {
+            assert_eq!(input.len(), 3 * self.0 * self.0);
+            Ok(input.to_vec())
+        }
+    }
+
+    fn ramp(w: usize, h: usize) -> Rgb32f {
+        let data = (0..w * h).map(|k| [(k % w) as f32 / w as f32, (k / w) as f32 / h as f32, ((k * 7) % 13) as f32 / 13.0]).collect();
+        Rgb32f { width: w, height: h, data }
+    }
+
+    #[test]
+    fn a_finished_picture_comes_back_as_the_model_gives_it_across_tiles_and_edges() {
+        // larger than a tile (several tiles, overlaps), smaller than a tile (mirrored), and one pixel
+        for (w, h) in [(70, 45), (10, 7), (1, 1)] {
+            let img = ramp(w, h);
+            let out = denoise_rgb(&img, &Same(32), &params(32, 8, Gain::None), &Control::default()).unwrap();
+            assert_eq!((out.width, out.height), (w, h));
+            for (a, b) in out.data.iter().zip(&img.data) {
+                for c in 0..3 {
+                    assert!((a[c] - b[c]).abs() < 1e-5, "{w}×{h}: {a:?} vs {b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_finished_picture_model_of_the_wrong_size_or_a_cancel_stops_it() {
+        struct Short;
+        impl TileRunner for Short {
+            fn run(&self, _: &[f32]) -> Result<Vec<f32>, Error> {
+                Ok(vec![0.5; 7])
+            }
+        }
+        let img = ramp(40, 40);
+        assert!(matches!(denoise_rgb(&img, &Short, &params(32, 8, Gain::None), &Control::default()), Err(Error::Model(_))));
+        let stop = AtomicBool::new(true);
+        let ctl = Control { cancel: Some(&stop), progress: None };
+        assert!(matches!(denoise_rgb(&img, &Same(32), &params(32, 8, Gain::None), &ctl), Err(Error::Cancelled)));
+        let bad = Rgb32f { width: 2, height: 1, data: vec![[f32::NAN; 3]; 2] };
+        assert!(matches!(denoise_rgb(&bad, &Same(32), &params(32, 8, Gain::None), &Control::default()), Err(Error::Input(_))));
     }
 }
