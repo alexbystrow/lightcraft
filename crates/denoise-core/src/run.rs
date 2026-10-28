@@ -232,7 +232,9 @@ pub fn denoise_bayer(
 
 /// Denoise a finished picture (`Domain::RgbToRgb`): `image` is gamma-encoded sRGB in 0 to 1, cut into overlapping
 /// `tile × tile` tiles (mirrored at the picture's edges when it is smaller than one), each run through the model and
-/// blended back. Gives the same encoding at the same size. The model's own scale is kept (`Gain::None`).
+/// blended back. Gives the same encoding at the same size. With `Gain::None` the model's answer is kept as it is; with
+/// `Gain::MatchMean` the picture's coarse colour and brightness are brought back to the input's (see below), which can
+/// leave values a little outside 0 to 1.
 pub fn denoise_rgb(image: &Rgb32f, runner: &dyn TileRunner, p: &Params, ctl: &Control<'_>) -> Result<Rgb32f, Error> {
     let (width, height) = (image.width, image.height);
     let pixels = width

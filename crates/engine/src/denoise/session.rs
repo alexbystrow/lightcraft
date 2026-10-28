@@ -62,18 +62,27 @@ impl Session {
                 model: Arc::new(Mutex::new(None)),
             })
         };
-        // another model: what was made with the old one is not this one's, and what failed may work now
+        // another model: what was made with the old one is not this one's, and what failed may work now; the photos of
+        // the other kind keep their job and their place in the queue
+        let mut changed: Vec<Domain> = Vec::new();
         if !same(&self.denoise.active, &raw) {
             self.denoise.active = activate(raw);
+            changed.push(Domain::BayerToRgb);
         }
         if !same(&self.denoise.active_rgb, &rgb) {
             self.denoise.active_rgb = activate(rgb);
+            changed.push(Domain::RgbToRgb);
         }
-        if let Some(r) = self.denoise.running.take() {
+        let affected =
+            |catalog: &lightcraft_catalog::Catalog, id: PhotoId| catalog.photo(id).and_then(|p| domain_of(p)).is_none_or(|d| changed.contains(&d));
+        if self.denoise.running.as_ref().is_some_and(|r| affected(&self.catalog, r.photo))
+            && let Some(r) = self.denoise.running.take()
+        {
             r.progress.cancel_now();
         }
-        self.denoise.queue.clear();
-        self.denoise.failed.clear();
+        let catalog = &self.catalog;
+        self.denoise.queue.retain(|id| !affected(catalog, *id));
+        self.denoise.failed.retain(|id, _| !affected(catalog, *id));
         self.denoise.dirty = true;
     }
 

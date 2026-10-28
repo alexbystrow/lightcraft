@@ -252,11 +252,21 @@ pub(crate) fn make_product(spec: &JobSpec, progress: Option<&Progress>) -> Resul
 }
 
 /// A finished picture as the model for finished pictures takes it: decoded at full size, unrotated (the product is the
-/// file's own pixels, as a raw's is its mosaic's), in gamma-encoded sRGB clipped to 0 to 1.
+/// file's own pixels, as a raw's is its mosaic's), transparency flattened onto white as the plain picture's is
+/// ([`lightcraft_codecs::Decoded::to_working`]), in gamma-encoded sRGB clipped to 0 to 1 (colours outside sRGB and
+/// values above white are clipped: the denoised picture of a wide-gamut or HDR file is the sRGB part of it).
 pub(crate) fn srgb_encoded(d: &lightcraft_codecs::Decoded) -> lightcraft_raster::Rgb32f {
     let m = d.space.to_space(&lightcraft_color::SRGB).to_f32();
     let enc = lightcraft_color::transfer::linear_to_srgb;
-    d.image.map(|p| {
+    let mut image = d.image.clone();
+    if let Some(a) = d.alpha.as_ref().filter(|a| a.width == image.width && a.height == image.height) {
+        // white is (1, 1, 1) in every space here, so it is flattened before the conversion as after it
+        for (p, &av) in image.data.iter_mut().zip(&a.data) {
+            let av = av.clamp(0.0, 1.0);
+            *p = p.map(|c| c * av + (1.0 - av));
+        }
+    }
+    image.map(|p| {
         let q = [
             m[0][0] * p[0] + m[0][1] * p[1] + m[0][2] * p[2],
             m[1][0] * p[0] + m[1][1] * p[1] + m[1][2] * p[2],
@@ -277,6 +287,9 @@ fn make_rgb_product(spec: &JobSpec, bytes: Vec<u8>, progress: Option<&Progress>,
         let d = lightcraft_codecs::decode(&bytes, lightcraft_codecs::DecodeOptions::default())
             .map_err(|e| MakeError::Unsupported(format!("not a picture this model can read: {e}")))?;
         drop(bytes);
+        // the decode and its sRGB copy (12 bytes a pixel each), counted once their size is known; it does not wait (a
+        // second wait on the gate while this job holds a permit could wait for itself)
+        let _pixels = crate::memory::work_gate().acquire_urgent(d.image.data.len().saturating_mul(24));
         srgb_encoded(&d)
     };
     if cancelled() {

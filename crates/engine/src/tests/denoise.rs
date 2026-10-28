@@ -998,3 +998,48 @@ fn a_finished_pictures_denoised_picture_comes_back_in_the_plain_pictures_colours
     assert!(worst <= 2, "a model that changes nothing changed a pixel by {worst} levels");
     let _ = std::fs::remove_dir_all(&x.dir);
 }
+
+#[test]
+fn a_transparent_finished_picture_is_denoised_on_white_as_it_is_shown() {
+    // the plain picture is flattened onto white: the denoised one must be too, or Amount 100 shows what lies under the
+    // transparency (black here)
+    let mut x = setup("finished-alpha", false);
+    let path = x.dir.join("originals").join("half-clear.png");
+    let rgba = lightcraft_raster::Rgba8::from_fn(150, 100, |px, _| if px < 75 { [0, 0, 0, 0] } else { [90, 140, 60, 255] });
+    let png = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&rgba), &lightcraft_codecs::EncodeMeta::default()).unwrap();
+    std::fs::write(&path, png).unwrap();
+    x.s.execute("library.import", &json!({"paths": [path.to_string_lossy()]})).unwrap();
+    let id = x.s.catalog.photos().find(|p| p.file_name == "half-clear.png").unwrap().id;
+    x.s.denoise.loader = Arc::new(|_, _| Ok(Arc::new(Same) as Arc<dyn Model>));
+    let onnx = rgb_model_files(&x.dir, "same");
+    x.s.execute("denoise.models.install", &json!({"path": onnx.to_string_lossy(), "acknowledged": true})).unwrap();
+    x.s.execute("library.select", &json!({"ids": [id.0]})).unwrap();
+    let plain = x.s.render_now(id, 160, 160).unwrap().image;
+    assert!(plain.data[10][0] > 200, "the plain picture shows white where it is clear: {:?}", plain.data[10]);
+    x.s.execute("denoise.toggle", &json!({"id": id.0, "enabled": true})).unwrap();
+    set_amount(&mut x.s, 100.0);
+    pump_until_ready(&mut x.s, 1);
+    let denoised = x.s.render_now(id, 160, 160).unwrap().image;
+    let worst = plain.data.iter().zip(&denoised.data).flat_map(|(a, b)| (0..3).map(move |c| a[c].abs_diff(b[c]))).max().unwrap();
+    assert!(worst <= 2, "the denoised picture differs by {worst} levels");
+    let _ = std::fs::remove_dir_all(&x.dir);
+}
+
+#[test]
+fn choosing_the_model_for_finished_pictures_leaves_the_raw_photos_queue_alone() {
+    let mut x = setup("slots-queue", true);
+    let raw = photo(&x.s);
+    x.s.execute("denoise.queue", &json!({"ids": [raw.0]})).unwrap();
+    x.s.denoise_pump(crate::denoise::Pace::Pause);
+    assert!(matches!(x.s.denoise_photo_state(raw), PhotoState::Queued { .. }), "{:?}", x.s.denoise_photo_state(raw));
+    let onnx = rgb_model_files(&x.dir, "stand-in-rgb");
+    x.s.execute("denoise.models.install", &json!({"path": onnx.to_string_lossy(), "acknowledged": true})).unwrap();
+    x.s.execute("denoise.models.select", &json!({"id": null, "kind": "rgb"})).unwrap();
+    x.s.denoise_pump(crate::denoise::Pace::Pause);
+    assert!(matches!(x.s.denoise_photo_state(raw), PhotoState::Queued { .. }), "{:?}", x.s.denoise_photo_state(raw));
+    // the raw model changing does drop it (another model's picture is another picture)
+    x.s.execute("denoise.models.select", &json!({"id": null})).unwrap();
+    x.s.denoise_pump(crate::denoise::Pace::Pause);
+    assert_eq!(x.s.denoise_photo_state(raw), PhotoState::NoModel);
+    let _ = std::fs::remove_dir_all(&x.dir);
+}
