@@ -82,7 +82,11 @@ fn self_test(runner: &dyn TileRunner, manifest: &DenoiserManifest, load_ms: f64)
     let (a, b) = (run(), run());
     match (&a, &b) {
         (Ok(a), Ok(b)) => {
-            checks.push((format!("gives {} finite numbers per tile", a.len()), true));
+            let expected = 3 * (domain.scale() * t) * (domain.scale() * t);
+            checks.push((
+                format!("gives {expected} finite numbers per tile (gave {})", a.len()),
+                a.len() == expected && a.iter().all(|v| v.is_finite()),
+            ));
             checks.push((
                 "gives the same answer for the same tile".into(),
                 a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-4 * x.abs().max(y.abs()).max(1e-9)),
@@ -92,10 +96,15 @@ fn self_test(runner: &dyn TileRunner, manifest: &DenoiserManifest, load_ms: f64)
             let mean_in = base.iter().map(|&v| f64::from(v)).sum::<f64>() / base.len().max(1) as f64;
             let mean_out = a.iter().map(|&v| f64::from(v)).sum::<f64>() / a.len().max(1) as f64;
             scale = if mean_in > 0.0 { mean_out / mean_in } else { 0.0 };
-            if let Gain::MatchMean { nominal, max_deviation } = manifest.gain {
-                let ratio = scale / f64::from(nominal);
-                let tolerance = f64::from(max_deviation).max(0.05) * 4.0;
-                checks.push((format!("its scale is the {nominal:.3e} the description says (found {scale:.3e})"), (ratio - 1.0).abs() <= tolerance));
+            match manifest.gain {
+                Gain::MatchMean { nominal, max_deviation } => {
+                    let ratio = scale / f64::from(nominal);
+                    let tolerance = f64::from(max_deviation).max(0.05) * 4.0;
+                    checks
+                        .push((format!("its scale is the {nominal:.3e} the description says (found {scale:.3e})"), (ratio - 1.0).abs() <= tolerance));
+                }
+                // nothing brings its answer back to the input's scale, so it must give it already
+                Gain::None => checks.push((format!("keeps the picture's brightness (found {scale:.3} times)"), (0.8..=1.25).contains(&scale))),
             }
             // noise left after bringing the answer back to the input's scale, against the noise that went in
             let g = if scale > 0.0 { 1.0 / scale } else { 1.0 };
@@ -400,6 +409,41 @@ mod tests {
         }
         let t = self_test(&Same, &rgb_manifest(32), 0.0);
         assert!(!t.ok && t.checks.iter().any(|(c, ok)| c.contains("noise") && !*ok), "{t:?}");
+    }
+
+    #[test]
+    fn an_rgb_model_that_brightens_or_gives_the_wrong_size_fails_its_self_test() {
+        // it denoises (a 3 × 3 mean), but doubles the picture: nothing brings a `gain: none` model back to scale
+        struct Bright(usize, f32, usize);
+        impl TileRunner for Bright {
+            fn run(&self, input: &[f32]) -> Result<Vec<f32>, Error> {
+                let t = self.0;
+                let mut out = vec![0f32; 3 * t * t];
+                for c in 0..3 {
+                    for y in 0..t {
+                        for x in 0..t {
+                            let (mut sum, mut n) = (0f32, 0f32);
+                            for (dy, dx) in (-1i32..=1).flat_map(|dy| (-1i32..=1).map(move |dx| (dy, dx))) {
+                                let (yy, xx) = (y as i32 + dy, x as i32 + dx);
+                                if yy >= 0 && xx >= 0 && (yy as usize) < t && (xx as usize) < t {
+                                    sum += input[c * t * t + yy as usize * t + xx as usize];
+                                    n += 1.0;
+                                }
+                            }
+                            out[c * t * t + y * t + x] = sum / n * self.1;
+                        }
+                    }
+                }
+                out.truncate(out.len().saturating_sub(self.2));
+                Ok(out)
+            }
+        }
+        let fine = self_test(&Bright(32, 1.0, 0), &rgb_manifest(32), 0.0);
+        assert!(fine.ok, "a model that denoises and keeps the scale passes: {fine:?}");
+        let bright = self_test(&Bright(32, 2.0, 0), &rgb_manifest(32), 0.0);
+        assert!(!bright.ok && bright.checks.iter().any(|(c, ok)| c.contains("brightness") && !*ok), "{bright:?}");
+        let short = self_test(&Bright(32, 1.0, 5), &rgb_manifest(32), 0.0);
+        assert!(!short.ok && short.checks.iter().any(|(c, ok)| c.contains("finite numbers") && !*ok), "{short:?}");
     }
 
     #[test]
