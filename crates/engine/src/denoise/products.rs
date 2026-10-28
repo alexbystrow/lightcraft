@@ -300,9 +300,11 @@ fn make_rgb_product(spec: &JobSpec, bytes: Vec<u8>, progress: Option<&Progress>,
     let scratch = model.bytes_per_tile().saturating_add(32usize.saturating_mul(t).saturating_mul(t));
     let (_, budget) = crate::memory::work_gate().usage();
     let parallel = spec.parallel.clamp(1, 4).min((budget / scratch.max(1)).max(1));
-    // the picture, the blended result and its weights, and (colour restore) two blurred copies with their working
-    // buffers: about 80 bytes a pixel at the peak
-    let _held = crate::memory::work_gate().acquire(image.data.len().saturating_mul(80).saturating_add(scratch.saturating_mul(parallel)));
+    // the picture, the blended result and its weights wait their turn (32 bytes a pixel); the colour restore's two
+    // blurred copies and their working buffers (48 more at the peak) are counted without waiting, so a big picture does
+    // not hold the whole gate (and the grid's thumbnails) for its whole run
+    let _held = crate::memory::work_gate().acquire(image.data.len().saturating_mul(32).saturating_add(scratch.saturating_mul(parallel)));
+    let _restore = crate::memory::work_gate().acquire_urgent(image.data.len().saturating_mul(48));
     let (runner, parallel) = model.runner(spec.run_on, parallel);
     let params = Params { tile: t, overlap: spec.manifest.overlap as usize, gain: spec.manifest.gain, clip: None, parallel: parallel.max(1) };
     let report = |done: usize, total: usize| {
