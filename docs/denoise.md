@@ -81,6 +81,12 @@ The picture is decoded at full size and unrotated, converted from its own colour
 clipped to sRGB), denoised tile by tile and cached like a raw photo's product. A render reads it back to the size of
 the plain decode, converts it to the working space as the plain picture is, and the Amount mixes the two.
 
+The picture is cut into overlapping tiles over a margin mirrored out from its edges, and each tile's outer quarter of
+the overlap counts for nothing: models get the edge of their tile wrong, and those pixels never reach the picture.
+A model whose manifest has `gain: matchMean` drifts in colour or brightness: its fine detail is kept and the
+picture's coarse colour and brightness (blurred over 8 pixels, `RESTORE_SIGMA`) come from the input again, by at
+most `maxDeviation` on the 0 to 1 scale.
+
 The `rawnind-model` build knows darktable's NIND U-Net (`denoise-nind.dtmodel`, GPL-3.0 weights, `nind-rgb`):
 768-cell tiles, ReLU layers and a final sigmoid, which the pure-Rust runners execute on the CPU and the graphics card.
 

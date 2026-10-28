@@ -953,3 +953,48 @@ fn a_finished_picture_has_a_model_of_its_own_and_its_amount_mixes_in_the_denoise
     assert!(x.s.denoise.active.is_some());
     let _ = std::fs::remove_dir_all(&x.dir);
 }
+
+/// A model for finished pictures that changes nothing.
+struct Same;
+
+impl TileRunner for Same {
+    fn run(&self, input: &[f32]) -> Result<Vec<f32>, lightcraft_denoise::Error> {
+        Ok(input.to_vec())
+    }
+}
+
+impl Model for Same {
+    fn runner(&self, _: RunOn, threads: usize) -> (&dyn TileRunner, usize) {
+        (self, threads)
+    }
+
+    fn self_test(&self, _: RunOn) -> Result<Value, String> {
+        Ok(json!({"ok": true}))
+    }
+}
+
+#[test]
+fn a_finished_pictures_denoised_picture_comes_back_in_the_plain_pictures_colours() {
+    // with a model that changes nothing, Amount 100 must render the plain picture: the trip to sRGB for the model and
+    // back to the working space for the render (and the product's half floats) lose nothing that shows
+    let mut x = setup("finished-colour", false);
+    let path = x.dir.join("originals").join("colours.png");
+    let img = lightcraft_raster::Rgba8::from_fn(150, 100, |px, py| [(20 + px) as u8, (200 - py) as u8, ((px * 7 + py * 3) % 256) as u8, 255]);
+    let o = ExportOptions { format: crate::export::ExportFormat::Png, ..Default::default() };
+    std::fs::write(&path, crate::export::encode_image(&img, &o).unwrap()).unwrap();
+    x.s.execute("library.import", &json!({"paths": [path.to_string_lossy()]})).unwrap();
+    let id = x.s.catalog.photos().find(|p| p.file_name == "colours.png").unwrap().id;
+    x.s.denoise.loader = Arc::new(|_, _| Ok(Arc::new(Same) as Arc<dyn Model>));
+    let onnx = rgb_model_files(&x.dir, "same");
+    x.s.execute("denoise.models.install", &json!({"path": onnx.to_string_lossy(), "acknowledged": true})).unwrap();
+    x.s.execute("library.select", &json!({"ids": [id.0]})).unwrap();
+    let plain = x.s.render_now(id, 160, 160).unwrap().image;
+    x.s.execute("denoise.toggle", &json!({"id": id.0, "enabled": true})).unwrap();
+    set_amount(&mut x.s, 100.0);
+    pump_until_ready(&mut x.s, 1);
+    let denoised = x.s.render_now(id, 160, 160).unwrap().image;
+    assert_eq!((plain.width, plain.height), (denoised.width, denoised.height));
+    let worst = plain.data.iter().zip(&denoised.data).flat_map(|(a, b)| (0..3).map(move |c| a[c].abs_diff(b[c]))).max().unwrap();
+    assert!(worst <= 2, "a model that changes nothing changed a pixel by {worst} levels");
+    let _ = std::fs::remove_dir_all(&x.dir);
+}

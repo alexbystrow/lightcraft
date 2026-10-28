@@ -84,7 +84,8 @@ fn nind_rgb() -> Known {
         domain: Domain::RgbToRgb,
         tile: 768,
         overlap: 64,
-        gain: Gain::None,
+        // its pictures come out a little brighter and cooler than they went in: the means are matched again
+        gain: Gain::MatchMean { nominal: 1.0, max_deviation: 0.1 },
     };
     let download = Download {
         id: manifest.id.clone(),
