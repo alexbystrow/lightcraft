@@ -61,6 +61,11 @@ impl CpuRunner {
     pub fn self_test(&self) -> SelfTest {
         self_test(self, &self.manifest, self.load_ms)
     }
+    /// One tile on every thread of the current Rayon pool, for a tile that is waited on: the same values as
+    /// [`TileRunner::run`], and the time it took summed over the threads (ms), about its time on one thread.
+    pub fn run_wide(&self, input: &[f32]) -> Result<(Vec<f32>, f64), Error> {
+        self.runner.run_wide(input)
+    }
 }
 impl TileRunner for CpuRunner {
     fn run(&self, input: &[f32]) -> Result<Vec<f32>, Error> {

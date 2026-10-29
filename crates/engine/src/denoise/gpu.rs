@@ -137,9 +137,11 @@ pub(super) fn make_gpu(cpu: &lightcraft_denoise::runtime::CpuRunner, path: &Path
         let card_ms = card_tile_ms(&runner, &on_card);
         Ok((runner, got, card_ms))
     };
-    let on_cpu = || {
-        let started = web_time::Instant::now();
-        (cpu.run(&input), started.elapsed().as_secs_f64() * 1000.0)
+    // The CPU's answer on every core, so an older CPU doesn't keep the card waiting for minutes; its time summed over
+    // the threads stands for one tile on one thread, which is what the card is compared with.
+    let on_cpu = || match cpu.run_wide(&input) {
+        Ok((want, cpu_ms)) => (Ok(want), cpu_ms),
+        Err(e) => (Err(e), f64::INFINITY),
     };
     let ((runner, got, card_ms), (want, cpu_ms)) = set_up_card(&path.with_file_name(GPU_SETUP_MARKER), GPU_SETUP_LIMIT, card, on_cpu)?;
     let want = want.map_err(|e| format!("the CPU could not check the GPU: {e}"))?;

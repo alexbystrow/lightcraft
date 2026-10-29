@@ -221,3 +221,20 @@ fn the_contracts_are_told_apart() {
     .unwrap();
     assert!(NetRunner::new(&odd, 2).is_err());
 }
+#[test]
+fn a_tile_spread_over_the_threads_gives_the_same_values_and_counts_its_work() {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+    // 144² positions are 81 blocks: more than one group, and a short last block
+    for (n, t, planes) in [(net(16, 4, 2, 11), 16usize, 4usize), (rgb_net(24, 4, 1, 12), 24, 3), (rgb_net(144, 4, 2, 13), 144, 3)] {
+        let r = NetRunner::new(&n, t).unwrap();
+        let x = random(planes * t * t, t as u32);
+        let one = r.run(&x).unwrap();
+        let (wide, busy_ms) = pool.install(|| r.run_wide(&x)).unwrap();
+        assert_eq!(wide, one, "tile {t}: the same blocks give the same values");
+        assert!(busy_ms > 0.0 && busy_ms.is_finite(), "{busy_ms}");
+        // the workspace goes back for reuse, and a plain run after a wide one is unchanged
+        assert_eq!(r.run(&x).unwrap(), one);
+    }
+    let r = NetRunner::new(&rgb_net(24, 4, 1, 12), 24).unwrap();
+    assert!(matches!(r.run_wide(&[f32::NAN; 3 * 24 * 24]), Err(Error::Input(_))));
+}
