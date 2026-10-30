@@ -17,7 +17,7 @@ pub struct SelfTest {
     pub ok: bool,
     /// Milliseconds to load and optimise the model.
     pub load_ms: f64,
-    /// Median milliseconds to run one tile.
+    /// Median milliseconds to run one tile, summed over the threads that shared it: about its time on one thread.
     pub tile_ms: f64,
     /// Megapixels of picture one tile covers, for estimating a whole photo's time.
     pub tile_megapixels: f64,
@@ -58,8 +58,10 @@ impl CpuRunner {
     pub fn out_side(&self) -> usize {
         self.runner.out_side()
     }
+    /// The installation self-test, its two tiles spread over the current Rayon pool like [`Self::run_wide`]: one tile
+    /// on one thread takes minutes on an older CPU. `tile_ms` is then the time summed over the threads.
     pub fn self_test(&self) -> SelfTest {
-        self_test(self, &self.manifest, self.load_ms)
+        check(&|input| self.run_wide(input), &self.manifest, self.load_ms)
     }
     /// One tile on every thread of the current Rayon pool, for a tile that is waited on: the same values as
     /// [`TileRunner::run`], and the time it took summed over the threads (ms), about its time on one thread.
@@ -72,17 +74,26 @@ impl TileRunner for CpuRunner {
         self.runner.run(input)
     }
 }
+#[cfg(test)]
 fn self_test(runner: &dyn TileRunner, manifest: &DenoiserManifest, load_ms: f64) -> SelfTest {
+    let timed = |input: &[f32]| {
+        let started = Instant::now();
+        runner.run(input).map(|out| (out, started.elapsed().as_secs_f64() * 1000.0))
+    };
+    check(&timed, manifest, load_ms)
+}
+/// The self-test with `run` giving a tile's answer and the milliseconds it took.
+fn check(run: &dyn Fn(&[f32]) -> Result<(Vec<f32>, f64), Error>, manifest: &DenoiserManifest, load_ms: f64) -> SelfTest {
     let t = manifest.tile as usize;
     let mut checks: Vec<(String, bool)> = Vec::new();
     let domain = manifest.domain;
     let (input, base) = test_tile_for(domain, t);
     let (mut times, mut scale) = (Vec::new(), 0.0f64);
     let mut run = || {
-        let started = Instant::now();
-        let r = runner.run(&input);
-        times.push(started.elapsed().as_secs_f64() * 1000.0);
-        r
+        run(&input).map(|(out, ms)| {
+            times.push(ms);
+            out
+        })
     };
     let (a, b) = (run(), run());
     match (&a, &b) {

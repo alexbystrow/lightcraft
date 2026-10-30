@@ -126,6 +126,14 @@ fn card_tile_ms(runner: &dyn TileRunner, input: &[f32]) -> f64 {
     best
 }
 
+/// Threads for a single tile that is waited on (the card's check tile, the installation self-test): as many as a job at
+/// full pace may take, and of their own, as the jobs have, so a busy window's renders keep theirs.
+#[cfg(feature = "denoise")]
+pub(super) fn check_pool() -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError> {
+    let threads = super::Pace::Full.parallel(std::thread::available_parallelism().map_or(1, |n| n.get()), None);
+    rayon::ThreadPoolBuilder::new().num_threads(threads).stack_size(STACK).thread_name(|i| format!("denoise-check-{i}")).build()
+}
+
 /// Set the card up for the model at `path`: kernels built, the check tile run on both and compared, both timed.
 #[cfg(feature = "denoise")]
 pub(super) fn make_gpu(cpu: &lightcraft_denoise::runtime::CpuRunner, path: &Path, tile: usize) -> Result<GpuSide, String> {
@@ -139,11 +147,9 @@ pub(super) fn make_gpu(cpu: &lightcraft_denoise::runtime::CpuRunner, path: &Path
     };
     // The CPU's answer on the cores a job at full pace may take, so an older CPU doesn't keep the card waiting for
     // minutes; its time summed over the threads stands for one tile on one thread, which is what the card is compared
-    // with. Threads of its own, as the jobs have, so a busy window's renders keep theirs.
+    // with.
     let on_cpu = || {
-        let threads = super::Pace::Full.parallel(std::thread::available_parallelism().map_or(1, |n| n.get()), None);
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).stack_size(STACK).thread_name(|i| format!("denoise-check-{i}")).build();
-        let wide = match pool {
+        let wide = match check_pool() {
             Ok(pool) => pool.install(|| cpu.run_wide(&input)),
             Err(e) => Err(lightcraft_denoise::run::Error::Runtime(format!("could not start the worker threads: {e}"))),
         };
